@@ -11,21 +11,24 @@ import {
 import type { WorkspaceType } from "@app/types/user";
 import {
   Button,
-  CardIcon,
   ContextItem,
   Input,
   Page,
   SliderToggle,
-  SparklesIcon,
-  Square3Stack3DIcon,
 } from "@dust-tt/sparkle";
 import { useState } from "react";
 
 interface ReinforcementSectionProps {
   owner: WorkspaceType;
+  onCapSaved?: (capMicroUsd: number) => void;
+  onDefaultCapPerSkillSaved?: (microUsd: number) => void;
 }
 
-export function ReinforcementSection({ owner }: ReinforcementSectionProps) {
+export function ReinforcementSection({
+  owner,
+  onCapSaved,
+  onDefaultCapPerSkillSaved,
+}: ReinforcementSectionProps) {
   const { isEnabled, isChanging, doToggleReinforcement } =
     useReinforcementToggle({ owner });
 
@@ -36,7 +39,7 @@ export function ReinforcementSection({ owner }: ReinforcementSectionProps) {
         <div className="h-full border-b border-border dark:border-border-night" />
         <ContextItem
           title="Allow self-improving skills"
-          visual={<SparklesIcon className="h-6 w-6 shrink-0" />}
+          visual={<></>}
           hasSeparatorIfLast={true}
           action={
             <SliderToggle
@@ -49,8 +52,11 @@ export function ReinforcementSection({ owner }: ReinforcementSectionProps) {
           <ContextItem.Description description="Allow Dust to analyze conversations to improve your workspace's skills. Dust does not use conversations to train models." />
         </ContextItem>
         <ReinforcementBatchModeToggle owner={owner} />
-        <ReinforcementCapItem owner={owner} />
-        <SelfImprovementCapPerSkillItem owner={owner} />
+        <ReinforcementCapItem owner={owner} onCapSaved={onCapSaved} />
+        <SelfImprovementCapPerSkillItem
+          owner={owner}
+          onSaved={onDefaultCapPerSkillSaved}
+        />
       </ContextItem.List>
     </Page.Vertical>
   );
@@ -63,7 +69,7 @@ function ReinforcementBatchModeToggle({ owner }: ReinforcementSectionProps) {
   return (
     <ContextItem
       title="Enable batch processing"
-      visual={<Square3Stack3DIcon className="h-6 w-6 shrink-0" />}
+      visual={<></>}
       hasSeparatorIfLast={true}
       action={
         <SliderToggle
@@ -78,7 +84,15 @@ function ReinforcementBatchModeToggle({ owner }: ReinforcementSectionProps) {
   );
 }
 
-function SelfImprovementCapPerSkillItem({ owner }: ReinforcementSectionProps) {
+interface SelfImprovementCapPerSkillItemProps {
+  owner: WorkspaceType;
+  onSaved?: (microUsd: number) => void;
+}
+
+function SelfImprovementCapPerSkillItem({
+  owner,
+  onSaved,
+}: SelfImprovementCapPerSkillItemProps) {
   const { capDollars, isSaving, saveCapDollars } =
     useSelfImprovementCapPerSkillSetting({ owner });
   const [inputValue, setInputValue] = useState<string>(() =>
@@ -98,13 +112,16 @@ function SelfImprovementCapPerSkillItem({ owner }: ReinforcementSectionProps) {
     if (!isInputDollarsValid) {
       return;
     }
-    await saveCapDollars(parsedInputDollars);
+    const ok = await saveCapDollars(parsedInputDollars);
+    if (ok) {
+      onSaved?.(Math.round(parsedInputDollars * 1_000_000));
+    }
   };
 
   return (
     <ContextItem
       title="Default cost cap per skill"
-      visual={<CardIcon className="h-6 w-6 shrink-0" />}
+      visual={<></>}
       hasSeparatorIfLast={true}
       action={
         <form
@@ -145,7 +162,10 @@ function SelfImprovementCapPerSkillItem({ owner }: ReinforcementSectionProps) {
   );
 }
 
-function ReinforcementCapItem({ owner }: ReinforcementSectionProps) {
+function ReinforcementCapItem({
+  owner,
+  onCapSaved,
+}: ReinforcementSectionProps) {
   const { capDollars, isSaving, saveCapDollars } = useReinforcementCapSetting({
     owner,
   });
@@ -165,13 +185,16 @@ function ReinforcementCapItem({ owner }: ReinforcementSectionProps) {
     if (!isInputValid) {
       return;
     }
-    await saveCapDollars(parsedInput);
+    const ok = await saveCapDollars(parsedInput);
+    if (ok) {
+      onCapSaved?.(Math.round(parsedInput * 1_000_000));
+    }
   };
 
   return (
     <ContextItem
       title="Global spending cap"
-      visual={<CardIcon className="h-6 w-6 shrink-0" />}
+      visual={<></>}
       hasSeparatorIfLast={true}
       action={
         <form
