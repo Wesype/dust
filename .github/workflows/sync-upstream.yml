@@ -1,0 +1,23 @@
+name: Sync fork with upstream
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'  # toutes les 6h
+  workflow_dispatch:         # déclenchable à la main aussi
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Sync with upstream
+        run: |
+          git remote add upstream https://github.com/dust-tt/dust.git
+          git fetch upstream
+          git checkout main
+          git merge upstream/main --no-edit
+          git push origin main
