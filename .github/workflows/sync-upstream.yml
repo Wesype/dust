@@ -32,15 +32,19 @@ jobs:
             exit 0
           fi
 
-          # Squash : collapse tous les commits upstream en 1 diff stagé (pas de commit upstream dans l'historique)
           git merge --squash upstream/main --allow-unrelated-histories -X theirs
 
-          # Retirer tout ce que l'upstream a mis dans .github/workflows/ (nouveaux fichiers inclus)
+          # Retirer les workflows upstream, restaurer les nôtres
           git rm -rf --cached .github/workflows/ 2>/dev/null || true
           rm -rf .github/workflows/
           git checkout HEAD -- .github/workflows/ 2>/dev/null || true
 
-          # Notre unique commit propre, sans aucun workflow change
+          # Ne committer que s'il reste des changements réels (pas que des workflows)
+          if git diff --cached --quiet; then
+            echo "✅ Upstream changes were workflows-only — nothing to push"
+            exit 0
+          fi
+
           git commit -m "chore: sync upstream dust-tt/dust $(date -u '+%Y-%m-%d')"
           git push origin main
           echo "✅ Done"
