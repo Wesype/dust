@@ -1,4 +1,3 @@
-import { getMembers } from "@app/lib/api/workspace";
 import type { Authenticator } from "@app/lib/auth";
 import {
   ceilToMidnightUTC,
@@ -7,10 +6,14 @@ import {
   listMetronomeUsageWithGroups,
 } from "@app/lib/metronome/client";
 import { getMetricLlmProviderCostAwuId } from "@app/lib/metronome/constants";
-import { METRONOME_USER_CREDIT_TO_MICRO_USD } from "@app/lib/metronome/types";
-import type { MembershipsPaginationParams } from "@app/lib/resources/membership_resource";
+import { buildSeatAllocationByUserId } from "@app/lib/metronome/seats";
+import {
+  MembershipResource,
+  type MembershipsPaginationParams,
+} from "@app/lib/resources/membership_resource";
 import { apiError } from "@app/logger/withlogging";
 import type { WithAPIErrorResponse } from "@app/types/error";
+import type { MembershipSeatType } from "@app/types/memberships";
 import type { NextApiRequest, NextApiResponse } from "next";
 import { z } from "zod";
 import { fromError } from "zod-validation-error";
@@ -20,7 +23,11 @@ export type MemberUsageType = {
   name: string;
   email: string | null;
   image: string | null;
-  consumedMicroUsd: number;
+  seatType: MembershipSeatType | null;
+  // Percentage of seat allocation consumed (0–100), null when seat balances are unavailable.
+  seatUsagePercent: number | null;
+  // Pool consumption only (AWU credits): total usage minus what was covered by the seat credit.
+  consumedWorkplacePoolCredits: number;
 };
 
 export type GetMembersUsageResponseBody = {
@@ -62,7 +69,7 @@ function buildUrlWithParams(
   return url.pathname + url.search;
 }
 
-async function fetchPerUserUsageMicroUsd({
+async function fetchPerUserUsageCredits({
   metronomeCustomerId,
   metronomeContractId,
 }: {
@@ -108,7 +115,7 @@ async function fetchPerUserUsageMicroUsd({
     startingOn,
     endingBefore,
     windowSize: "NONE",
-    groupKey: ["user_id"],
+    groupKey: ["user_id", "usage_type"],
   });
 
   if (usageResult.isErr()) {
@@ -118,15 +125,12 @@ async function fetchPerUserUsageMicroUsd({
   const perUser = new Map<string, number>();
   for (const entry of usageResult.value) {
     const userId = entry.group?.["user_id"];
-    // Skip programmatic events — they carry user_id="unknown" (see events.ts).
-    if (!userId || userId === "unknown" || entry.value === null) {
+    const usageType = entry.group?.["usage_type"];
+    if (!userId || usageType !== "user" || entry.value === null) {
       continue;
     }
     const existing = perUser.get(userId) ?? 0;
-    perUser.set(
-      userId,
-      existing + entry.value * METRONOME_USER_CREDIT_TO_MICRO_USD
-    );
+    perUser.set(userId, existing + entry.value);
   }
   return perUser;
 }
@@ -163,24 +167,57 @@ export async function handleGetMembersUsageRequest(
       const workspace = auth.getNonNullableWorkspace();
       const subscription = auth.subscription();
       const { metronomeCustomerId } = workspace;
+      const metronomeContractId = subscription?.metronomeContractId ?? null;
 
-      const [membersResult, perUserUsageMicroUsd] = await Promise.all([
-        getMembers(auth, { activeOnly: true }, paginationParams),
-        fetchPerUserUsageMicroUsd({
-          metronomeCustomerId: metronomeCustomerId ?? null,
-          metronomeContractId: subscription?.metronomeContractId ?? null,
-        }),
-      ]);
+      const [membershipsResult, perUserTotalCredits, seatAllocationByUserId] =
+        await Promise.all([
+          MembershipResource.getActiveMemberships({
+            workspace,
+            paginationParams,
+          }),
+          fetchPerUserUsageCredits({
+            metronomeCustomerId: metronomeCustomerId ?? null,
+            metronomeContractId,
+          }),
+          metronomeCustomerId && metronomeContractId
+            ? buildSeatAllocationByUserId({
+                metronomeCustomerId,
+                contractId: metronomeContractId,
+              })
+            : Promise.resolve(new Map<string, number>()),
+        ]);
 
-      const { members, total, nextPageParams } = membersResult;
+      const { memberships, total, nextPageParams } = membershipsResult;
 
-      const membersUsage: MemberUsageType[] = members.map((m) => ({
-        sId: m.sId,
-        name: m.fullName,
-        email: m.email ?? null,
-        image: m.image ?? null,
-        consumedMicroUsd: perUserUsageMicroUsd.get(m.sId) ?? 0,
-      }));
+      const membersUsage: MemberUsageType[] = memberships.flatMap((m) => {
+        if (!m.user) {
+          return [];
+        }
+        const userId = m.user.sId;
+        const totalCredits = perUserTotalCredits.get(userId) ?? 0;
+        const seatAllocation = seatAllocationByUserId.get(userId) ?? 0;
+
+        let seatUsagePercent: number | null = null;
+        let poolConsumedCredits = totalCredits;
+
+        if (seatAllocation > 0) {
+          const seatConsumed = Math.min(totalCredits, seatAllocation);
+          seatUsagePercent = (seatConsumed / seatAllocation) * 100;
+          poolConsumedCredits = Math.max(0, totalCredits - seatAllocation);
+        }
+
+        return [
+          {
+            sId: userId,
+            name: m.user.name,
+            email: m.user.email ?? null,
+            image: m.user.imageUrl ?? null,
+            seatType: m.seatType ?? null,
+            seatUsagePercent,
+            consumedWorkplacePoolCredits: poolConsumedCredits,
+          },
+        ];
+      });
 
       return res.status(200).json({
         members: membersUsage,

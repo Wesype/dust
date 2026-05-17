@@ -9,19 +9,19 @@ import {
 import {
   getCreditTypeAwuId,
   getMetricLlmProviderCostAwuId,
+  getSeatProductIds,
 } from "@app/lib/metronome/constants";
-import { METRONOME_USER_CREDIT_TO_MICRO_USD } from "@app/lib/metronome/types";
+import { buildSeatAllocationByUserId } from "@app/lib/metronome/seats";
 import { apiError } from "@app/logger/withlogging";
 import type { WithAPIErrorResponse } from "@app/types/error";
+import type { NextApiRequest, NextApiResponse } from "next";
 
 export type AwuPoolSummaryResponseBody = {
-  totalAmountMicroUsd: number;
-  consumedByUsersMicroUsd: number;
-  consumedByProgrammaticMicroUsd: number;
+  totalCredits: number;
+  consumedByUsersCredits: number;
+  consumedByProgrammaticCredits: number;
   resetDate: string;
 };
-
-import type { NextApiRequest, NextApiResponse } from "next";
 
 export async function handleAwuPoolSummaryRequest(
   req: NextApiRequest,
@@ -69,7 +69,6 @@ export async function handleAwuPoolSummaryRequest(
           },
         });
       }
-
       if (invoicesResult.isErr()) {
         return apiError(req, res, {
           status_code: 500,
@@ -97,11 +96,43 @@ export async function handleAwuPoolSummaryRequest(
 
       if (!currentInvoice?.start_timestamp || !currentInvoice.end_timestamp) {
         return res.status(200).json({
-          totalAmountMicroUsd: 0,
-          consumedByUsersMicroUsd: 0,
-          consumedByProgrammaticMicroUsd: 0,
+          totalCredits: 0,
+          consumedByUsersCredits: 0,
+          consumedByProgrammaticCredits: 0,
           resetDate: "",
         });
+      }
+
+      const resetDate = ceilToMidnightUTC(
+        new Date(currentInvoice.end_timestamp)
+      ).toISOString();
+
+      // Filter to active, non-seat AWU pool credits and commits.
+      const awuCreditTypeId = getCreditTypeAwuId();
+      const seatProductIds = getSeatProductIds();
+      const awuBalances = balancesResult.value.filter(
+        (entry) =>
+          entry.access_schedule?.credit_type?.id === awuCreditTypeId &&
+          !seatProductIds.has(entry.product.id)
+      );
+
+      // Sum the remaining balance of each active pool credit.
+      // entry.balance accounts for prior-period consumption (e.g. a carried-over prepaid
+      // top-off that was partially consumed in a previous billing cycle). Upcoming and
+      // expired schedule segments contribute 0 to the balance, so this is safe for
+      // multi-period recurring credits too.
+      let totalCredits = 0;
+      for (const entry of awuBalances) {
+        const isActive = (entry.access_schedule?.schedule_items ?? []).some(
+          (item) => {
+            const itemStartMs = new Date(item.starting_at).getTime();
+            const itemEndMs = new Date(item.ending_before).getTime();
+            return itemStartMs <= now && now < itemEndMs;
+          }
+        );
+        if (isActive) {
+          totalCredits += entry.balance ?? 0;
+        }
       }
 
       const startingOn = floorToMidnightUTC(
@@ -110,68 +141,68 @@ export async function handleAwuPoolSummaryRequest(
       const endingBefore = ceilToMidnightUTC(
         new Date(currentInvoice.end_timestamp)
       ).toISOString();
-      const resetDate = endingBefore;
 
-      // Sum the AWU pool size from active balance entries within the current billing period.
-      const awuCreditTypeId = getCreditTypeAwuId();
-      const awuBalances = balancesResult.value.filter(
-        (entry) => entry.access_schedule?.credit_type?.id === awuCreditTypeId
-      );
-
-      let totalAmountMicroUsd = 0;
-      for (const entry of awuBalances) {
-        for (const item of entry.access_schedule?.schedule_items ?? []) {
-          const itemStartMs = new Date(item.starting_at).getTime();
-          const itemEndMs = new Date(item.ending_before).getTime();
-          if (itemStartMs <= now && now < itemEndMs) {
-            totalAmountMicroUsd +=
-              item.amount * METRONOME_USER_CREDIT_TO_MICRO_USD;
-          }
-        }
-      }
-
-      // Single merged AWU metric, grouped by `is_programmatic_usage` —
-      // authoritative flag set by the event emitter (see events.ts). Sentinel
-      // values like user_id/api_key_name = "unknown" are not reliable since
-      // programmatic callers without an API key also emit user_id="unknown".
-      const usageResult = await listMetronomeUsageWithGroups({
-        customerId: metronomeCustomerId,
-        billableMetricId: getMetricLlmProviderCostAwuId(),
-        startingOn,
-        endingBefore,
-        windowSize: "NONE",
-        groupKey: ["is_programmatic_usage"],
-      });
+      // Query usage per user and seat allocations in parallel.
+      // Per-user breakdown is needed to compute pool overflow correctly:
+      // seat credits cover each user up to their allocation; only the excess
+      // draws from the workspace pool.
+      const [usageResult, seatAllocationByUserId] = await Promise.all([
+        listMetronomeUsageWithGroups({
+          customerId: metronomeCustomerId,
+          billableMetricId: getMetricLlmProviderCostAwuId(),
+          startingOn,
+          endingBefore,
+          windowSize: "NONE",
+          groupKey: ["user_id", "usage_type"],
+        }),
+        buildSeatAllocationByUserId({
+          metronomeCustomerId,
+          contractId: metronomeContractId,
+        }),
+      ]);
 
       if (usageResult.isErr()) {
         return apiError(req, res, {
           status_code: 500,
           api_error: {
             type: "internal_server_error",
-            message: `Failed to retrieve AWU usage: ${usageResult.error.message}`,
+            message: `Failed to retrieve Metronome usage: ${usageResult.error.message}`,
           },
         });
       }
 
-      let userAwu = 0;
-      let programmaticAwu = 0;
-      for (const entry of usageResult.value) {
-        const value = entry.value ?? 0;
-        if (entry.group?.["is_programmatic_usage"] === "true") {
-          programmaticAwu += value;
+      // Aggregate per-user consumption from the usage metric.
+      const perUserCredits = new Map<string, number>();
+      let consumedByProgrammaticCredits = 0;
+
+      for (const row of usageResult.value) {
+        const credits = row.value ?? 0;
+        const usageType = row.group?.["usage_type"];
+        if (usageType === "programmatic") {
+          consumedByProgrammaticCredits += credits;
         } else {
-          userAwu += value;
+          const userId = row.group?.["user_id"];
+          if (userId) {
+            perUserCredits.set(
+              userId,
+              (perUserCredits.get(userId) ?? 0) + credits
+            );
+          }
         }
       }
-      const consumedByUsersMicroUsd =
-        userAwu * METRONOME_USER_CREDIT_TO_MICRO_USD;
-      const consumedByProgrammaticMicroUsd =
-        programmaticAwu * METRONOME_USER_CREDIT_TO_MICRO_USD;
+
+      // Pool user consumption = sum of each user's overflow beyond their seat allocation.
+      // Users without a seat: all their usage is pool consumption.
+      let consumedByUsersCredits = 0;
+      for (const [userId, userCredits] of perUserCredits) {
+        const seatAllocation = seatAllocationByUserId.get(userId) ?? 0;
+        consumedByUsersCredits += Math.max(0, userCredits - seatAllocation);
+      }
 
       return res.status(200).json({
-        totalAmountMicroUsd,
-        consumedByUsersMicroUsd,
-        consumedByProgrammaticMicroUsd,
+        totalCredits,
+        consumedByUsersCredits,
+        consumedByProgrammaticCredits,
         resetDate,
       });
     }

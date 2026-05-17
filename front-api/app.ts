@@ -1,42 +1,53 @@
 import { Hono } from "hono";
+import { RegExpRouter } from "hono/router/reg-exp-router";
+import { SmartRouter } from "hono/router/smart-router";
+import { TrieRouter } from "hono/router/trie-router";
 
 import { cors } from "./middleware/cors";
+import { appStatusApp } from "./routes/app-status";
+import { loginApp } from "./routes/auth/login";
+import { authContextApp } from "./routes/auth-context";
+import { createNewWorkspaceApp } from "./routes/create-new-workspace";
 import { healthzApp } from "./routes/healthz";
+import { invitationsApp } from "./routes/invitations";
+import { killApp } from "./routes/kill";
+import { publicWorkspaceApp } from "./routes/v1/w";
 import { workspaceApp } from "./routes/w";
-
-// Single source of truth for which routes are served natively by Hono.
-// Anything not listed here is delegated to the Next.js handler. OPTIONS is
-// auto-added for every pattern with any other method so CORS preflights for
-// Hono-served routes are handled by the Hono CORS middleware rather than
-// Next.js.
-type HonoMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "OPTIONS";
-
-interface HonoRoute {
-  pattern: string;
-  methods: HonoMethod[];
-}
-
-const HONO_ROUTES: HonoRoute[] = [
-  { pattern: "/api/healthz", methods: ["GET"] },
-  { pattern: "/api/w/:wId/spaces", methods: ["GET", "POST"] },
-];
-
-const HONO_ROUTE_REGEXES = HONO_ROUTES.map((r) => {
-  const methods = new Set<HonoMethod>(r.methods);
-  methods.add("OPTIONS");
-  return {
-    methods,
-    regex: new RegExp(`^${r.pattern.replace(/:[^/]+/g, "[^/]+")}$`),
-  };
-});
+import { workspaceLookupApp } from "./routes/workspace-lookup";
 
 const apiApp = new Hono();
 apiApp.route("/healthz", healthzApp);
+apiApp.route("/app-status", appStatusApp);
+apiApp.route("/auth/login", loginApp);
+apiApp.route("/auth-context", authContextApp);
+apiApp.route("/create-new-workspace", createNewWorkspaceApp);
+apiApp.route("/invitations", invitationsApp);
+apiApp.route("/kill", killApp);
+apiApp.route("/workspace-lookup", workspaceLookupApp);
 apiApp.route("/w/:wId", workspaceApp);
+apiApp.route("/v1/w/:wId", publicWorkspaceApp);
 
 export const honoApp = new Hono();
 honoApp.use("*", cors);
 honoApp.route("/api", apiApp);
+
+// Dispatch index for isHonoRoute(). Built from honoApp's flattened route
+// table — registering a Hono route is the single source of truth for whether
+// a request goes to Hono vs Next. Filters out middleware (method "ALL"), so
+// only concrete handlers count.
+//
+// SmartRouter tries RegExpRouter first (O(1) via a single compiled regex)
+// and falls back to TrieRouter for path combinations RegExp can't handle
+// (e.g., two routes diverging at the same depth with different param names).
+const dispatchRouter = new SmartRouter<true>({
+  routers: [new RegExpRouter<true>(), new TrieRouter<true>()],
+});
+for (const route of honoApp.routes) {
+  if (route.method === "ALL") continue;
+  dispatchRouter.add(route.method, route.path, true);
+}
+
+const PREFLIGHT_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE"] as const;
 
 export function isHonoRoute(
   method: string | undefined,
@@ -49,7 +60,18 @@ export function isHonoRoute(
   const queryStart = url.indexOf("?");
   const path = queryStart === -1 ? url : url.slice(0, queryStart);
 
-  return HONO_ROUTE_REGEXES.some(
-    (r) => r.methods.has(method as HonoMethod) && r.regex.test(path)
-  );
+  if (dispatchRouter.match(method, path)[0].length > 0) {
+    return true;
+  }
+
+  // CORS preflight: route OPTIONS to Hono whenever any non-OPTIONS method is
+  // registered for the path, so the cors middleware can short-circuit.
+  if (method === "OPTIONS") {
+    for (const m of PREFLIGHT_METHODS) {
+      if (dispatchRouter.match(m, path)[0].length > 0) {
+        return true;
+      }
+    }
+  }
+  return false;
 }

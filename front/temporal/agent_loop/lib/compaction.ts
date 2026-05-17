@@ -1,6 +1,6 @@
 import type { LLMConfig } from "@app/lib/api/assistant/call_llm";
 import { runMultiActionsAgent } from "@app/lib/api/assistant/call_llm";
-import { updateCompactionMessageWithContentAndFinalStatus } from "@app/lib/api/assistant/conversation";
+import { updateCompactionMessageWithContentAndFinalStatus } from "@app/lib/api/assistant/conversation/compaction";
 import { replaceStandaloneAttachmentIds } from "@app/lib/api/assistant/conversation/compaction_attachment_id_replacements";
 import { getConversation } from "@app/lib/api/assistant/conversation/fetch";
 import { renderConversationAsText } from "@app/lib/api/assistant/conversation/render_as_text";
@@ -369,13 +369,21 @@ async function generateCompactionSummary(
     includeActions: true,
     includeActionDetails: true,
     skipRunningAgentMessages: true,
+    truncateTotalChars: 512000, // Simple heuristic to avoid context overflow with most models.
   });
 
-  // TODO(compaction): Ensure we don't exceeds the model context size here, as we have no guarantee
-  // that the current conversation is not exceeding it already.
   // TODO(compaction): We may want to be more mechanical about files available to the model in
   // conversation and projects by including a list as part of the summary.
   // TODO(compaction: We may want to add retries around the LLM call
+
+  logger.info(
+    {
+      workspaceId: owner.sId,
+      conversationId: conversationToSummarize.sId,
+      renderedMessagesLength: renderedMessages.length,
+    },
+    "Compaction generation started"
+  );
 
   const conv: ModelConversationTypeMultiActions = {
     messages: [
