@@ -7,34 +7,40 @@ on:
 
 permissions:
   contents: write
-  actions: write
-  pull-requests: write
-  checks: write
 
 jobs:
   sync:
-    name: Sync main branch from upstream
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout fork
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Configure Git identity
+      - name: Configure Git
         run: |
-          git config --global user.email "action@github.com"
-          git config --global user.name "GitHub Action"
+          git config user.email "action@github.com"
+          git config user.name "GitHub Action"
 
-      - name: Sync upstream sans les workflows
+      - name: Sync upstream (exclude .github/workflows/)
         run: |
           git remote add upstream https://github.com/dust-tt/dust.git
           git fetch upstream
-          git checkout main
-          git merge upstream/main --no-edit --allow-unrelated-histories
-          git checkout HEAD -- .github/workflows/
-          git push origin main
 
-      - name: Log sync result
-        run: echo "✅ Fork synced with dust-tt/dust at $(date)"
+          if git diff --quiet HEAD upstream/main; then
+            echo "✅ Already up to date"
+            exit 0
+          fi
+
+          # Squash : collapse tous les commits upstream en 1 diff stagé (pas de commit upstream dans l'historique)
+          git merge --squash upstream/main --allow-unrelated-histories -X theirs
+
+          # Retirer tout ce que l'upstream a mis dans .github/workflows/ (nouveaux fichiers inclus)
+          git rm -rf --cached .github/workflows/ 2>/dev/null || true
+          rm -rf .github/workflows/
+          git checkout HEAD -- .github/workflows/ 2>/dev/null || true
+
+          # Notre unique commit propre, sans aucun workflow change
+          git commit -m "chore: sync upstream dust-tt/dust $(date -u '+%Y-%m-%d')"
+          git push origin main
+          echo "✅ Done"
