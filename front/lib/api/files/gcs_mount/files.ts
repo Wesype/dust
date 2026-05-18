@@ -10,7 +10,10 @@ import type { ConversationResource } from "@app/lib/resources/conversation_resou
 import { FileResource } from "@app/lib/resources/file_resource";
 import { concurrentExecutor } from "@app/lib/utils/async_utils";
 import logger from "@app/logger/logger";
-import { isSupportedImageContentType } from "@app/types/files";
+import {
+  isSupportedImageContentType,
+  stripMimeParameters,
+} from "@app/types/files";
 import { Err, Ok, type Result } from "@app/types/shared/result";
 import { assertNever } from "@app/types/shared/utils/assert_never";
 import { normalizeError } from "@app/types/shared/utils/error_utils";
@@ -36,6 +39,8 @@ export type GCSMountFileEntry = GCSMountEntryBase & {
   contentType: string;
   fileId: string | null;
   thumbnailUrl: string | null;
+  /** Present when the listing endpoint adds read-signed URLs (e.g. system project_files API). */
+  signedDownloadUrl?: string | null;
 };
 
 export type GCSMountEntry = GCSMountDirectoryEntry | GCSMountFileEntry;
@@ -115,7 +120,7 @@ function makeFileEntry(
     fileName,
     relativeFilePath,
     sizeBytes,
-    contentType,
+    contentType: rawContentType,
     lastModifiedMs,
     fileId,
   }: {
@@ -129,6 +134,10 @@ function makeFileEntry(
   scope: GCSMountPoint,
   workspaceId: string
 ): GCSMountFileEntry {
+  // GCS metadata commonly carries MIME parameters (e.g. `text/csv; charset=utf-8`).
+  // Strip them at the module boundary so every downstream consumer sees a clean type
+  // that matches our content-type lookup tables exactly.
+  const contentType = stripMimeParameters(rawContentType);
   return {
     isDirectory: false,
     fileName,
@@ -191,7 +200,23 @@ export async function listGCSMountFiles(
   const prefix = resolvePrefix(owner, scope);
 
   const bucket = getPrivateUploadBucket();
-  const gcsFiles = await bucket.getFiles({ prefix, maxResults: 200 });
+  const { files: gcsFiles, pageFetchCount } = await bucket.getAllFilesByPrefix({
+    prefix,
+    pageSize: 200,
+  });
+
+  if (pageFetchCount > 1) {
+    logger.warn(
+      {
+        workspaceId: owner.sId,
+        prefix,
+        scope,
+        pageFetchCount,
+        objectCount: gcsFiles.length,
+      },
+      "GCS mount file listing required multiple list requests; prefix has many objects."
+    );
+  }
 
   // GCS folder placeholders are zero-byte objects whose path ends with "/".
   const folderPlaceholders = gcsFiles.filter((f) => f.name.endsWith("/"));
